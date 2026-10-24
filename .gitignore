@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+bot.log
+bot.py.backup*
+bot.py.before_discovery
+botaltofan
+botaltofan.bak
+data/

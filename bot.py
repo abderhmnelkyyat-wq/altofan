@@ -98,6 +98,24 @@ def init_db():
             )
         """)
 
+        order_columns = {
+            row[1] for row in con.execute("PRAGMA table_info(orders)")
+        }
+        if "customer_name" not in order_columns:
+            con.execute("ALTER TABLE orders ADD COLUMN customer_name TEXT DEFAULT ''")
+        if "phone" not in order_columns:
+            con.execute("ALTER TABLE orders ADD COLUMN phone TEXT DEFAULT ''")
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS support_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT DEFAULT 'جديد',
+                created TEXT NOT NULL
+            )
+        """)
+
         defaults = {
             "bot_name": "Altofan Social",
             "welcome": "أهلاً بيك في Altofan Social 🚀",
@@ -500,15 +518,12 @@ async def button_handler(
             )
             return
 
-        context.user_data["state"] = "order_details"
+        context.user_data["state"] = "order_name"
         context.user_data["selected_service"] = selected[1]
 
         await query.edit_message_text(
             f"✅ اخترت: {selected[1]}\n\n"
-            "اكتب تفاصيل طلبك في رسالة واحدة.\n"
-            "مثال: رابط الصفحة، نوع التصميم، "
-            "الكمية المطلوبة، وأي ملاحظات.\n\n"
-            "⚠️ متبعتش كلمات مرور أو أكواد تحقق.",
+            "👤 اكتب اسمك بالكامل أولًا.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "❌ إلغاء",
@@ -517,9 +532,26 @@ async def button_handler(
             ]]),
         )
 
+    elif data.startswith("support_reply:"):
+        if not is_admin(user_id):
+            await query.answer("غير مسموح لك.", show_alert=True)
+            return
+        target_id = int(data.split(":", 1)[1])
+        context.user_data["state"] = f"support_reply:{target_id}"
+        await query.message.reply_text(
+            f"✍️ اكتب ردك على المستخدم {target_id} في رسالة واحدة.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
+            ]]),
+        )
+
     elif data == "cancel":
         context.user_data.pop("state", None)
-        context.user_data.pop("selected_service", None)
+        for key in (
+            "selected_service", "customer_name", "customer_phone",
+            "support_reply_user",
+        ):
+            context.user_data.pop(key, None)
 
         await query.edit_message_text(
             "تم إلغاء العملية.",
@@ -563,19 +595,14 @@ async def button_handler(
         )
 
     elif data == "support":
-        support = get_setting("support", "@AltofanSocial")
-
+        context.user_data["state"] = "support_message"
         await query.edit_message_text(
-            "🆘 <b>الدعم الفني</b>\n\n"
-            "للاستفسارات ومتابعة الطلبات:\n"
-            f"{support}\n\n"
-            "يمكنك مراسلة الدعم وذكر رقم طلبك إن وجد.",
-            parse_mode="HTML",
+            "🆘 الدعم الفني\n\n"
+            "اكتب استفسارك أو شكواك في رسالة واحدة، "
+            "وسنرسلها للإدارة للرد عليك.\n\n"
+            "لا ترسل كلمات مرور أو أكواد تحقق.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "🏠 الرئيسية",
-                    callback_data="home",
-                )
+                InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
             ]]),
         )
 
@@ -1285,11 +1312,97 @@ async def text_handler(
             ]),
         )
 
+    elif state == "order_name":
+        customer_name = message.text.strip()
+        if not 2 <= len(customer_name) <= 100:
+            await message.reply_text("اكتب اسمًا من 2 إلى 100 حرف.")
+            return
+        context.user_data["customer_name"] = customer_name
+        context.user_data["state"] = "order_phone"
+        await message.reply_text(
+            "📱 اكتب رقم هاتفك للتواصل معك بخصوص الطلب.\n"
+            "اكتب الرقم مع مفتاح الدولة إن أمكن."
+        )
+
+    elif state == "order_phone":
+        phone = message.text.strip()
+        digits = sum(ch.isdigit() for ch in phone)
+        if digits < 7 or len(phone) > 30:
+            await message.reply_text("رقم الهاتف غير واضح. أعد كتابته من فضلك.")
+            return
+        context.user_data["customer_phone"] = phone
+        context.user_data["state"] = "order_details"
+        await message.reply_text(
+            "📝 اكتب تفاصيل طلبك في رسالة واحدة.\n"
+            "مثال: رابط الصفحة، نوع التصميم، الكمية المطلوبة، وأي ملاحظات.\n\n"
+            "⚠️ لا ترسل كلمات مرور أو أكواد تحقق."
+        )
+
+    elif state == "support_message":
+        support_text = message.text.strip()
+        if not 2 <= len(support_text) <= 3500:
+            await message.reply_text("اكتب رسالة من 2 إلى 3500 حرف.")
+            return
+        created = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with db() as con:
+            cur = con.execute(
+                "INSERT INTO support_messages (user_id, message, status, created) "
+                "VALUES (?, ?, 'جديد', ?)",
+                (user.id, support_text, created),
+            )
+            support_id = cur.lastrowid
+        context.user_data.pop("state", None)
+        await message.reply_text(
+            f"✅ تم إرسال رسالتك للدعم الفني. رقم المتابعة: #{support_id}",
+            reply_markup=main_keyboard(),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🆘 رسالة دعم جديدة #{support_id}\n\n"
+                    f"👤 العميل: {user.full_name}\n"
+                    f"🆔 المستخدم: {user.id}\n"
+                    f"💬 الرسالة:\n{support_text}"
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "↩️ الرد على العميل",
+                        callback_data=f"support_reply:{user.id}",
+                    )
+                ]]),
+            )
+        except Exception:
+            logger.exception("Could not notify administrator about support message")
+
+    elif state.startswith("support_reply:"):
+        if not is_admin(user.id):
+            context.user_data.pop("state", None)
+            await message.reply_text("غير مسموح لك.")
+            return
+        target_id = int(state.split(":", 1)[1])
+        reply_text = message.text.strip()
+        if not reply_text:
+            await message.reply_text("اكتب نص الرد.")
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"💬 رد الدعم الفني من Altofan Social:\n\n{reply_text}",
+            )
+            context.user_data.pop("state", None)
+            await message.reply_text("✅ تم إرسال الرد للعميل.", reply_markup=admin_keyboard())
+        except Exception:
+            logger.exception("Could not send support reply")
+            await message.reply_text("تعذر إرسال الرد. قد يكون العميل لم يبدأ البوت.")
+
     elif state == "order_details":
         service = context.user_data.get(
             "selected_service",
             "خدمة غير محددة",
         )
+        customer_name = context.user_data.get("customer_name", user.full_name)
+        phone = context.user_data.get("customer_phone", "")
 
         details = message.text.strip()
 
@@ -1303,8 +1416,8 @@ async def text_handler(
             cursor = con.execute(
                 """
                 INSERT INTO orders
-                (user_id, service, details, status, created)
-                VALUES (?, ?, ?, ?, ?)
+                (user_id, service, details, status, created, customer_name, phone)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user.id,
@@ -1312,6 +1425,8 @@ async def text_handler(
                     details,
                     "جديد",
                     datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    customer_name,
+                    phone,
                 ),
             )
             order_id = cursor.lastrowid
@@ -1333,7 +1448,8 @@ async def text_handler(
                 chat_id=ADMIN_ID,
                 text=(
                     f"🆕 طلب جديد #{order_id}\n\n"
-                    f"👤 العميل: {user.full_name}\n"
+                    f"👤 العميل: {customer_name}\n"
+                    f"📱 الهاتف: {phone}\n"
                     f"🆔 المستخدم: {user.id}\n"
                     f"📌 الخدمة: {service}\n"
                     f"📝 التفاصيل:\n{details}"
